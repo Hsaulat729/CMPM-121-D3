@@ -1,115 +1,235 @@
 // @deno-types="npm:@types/leaflet"
 import leaflet from "leaflet";
 
-// Style sheets
-import "leaflet/dist/leaflet.css"; // supporting style for Leaflet
-import "./style.css"; // student-controlled page style
+// Styles
+import "leaflet/dist/leaflet.css";
+import "./style.css";
 
 // Fix missing marker images
-import "./_leafletWorkaround.ts"; // fixes for missing Leaflet images
+import "./_leafletWorkaround.ts";
 
-// Import our luck function
+// Deterministic hashing function
 import luck from "./_luck.ts";
 
-// Create basic UI elements
+// ---------------------------------------------------------
+// CONSTANTS
+// ---------------------------------------------------------
 
-const controlPanelDiv = document.createElement("div");
-controlPanelDiv.id = "controlPanel";
-document.body.append(controlPanelDiv);
-
-const mapDiv = document.createElement("div");
-mapDiv.id = "map";
-document.body.append(mapDiv);
-
-const statusPanelDiv = document.createElement("div");
-statusPanelDiv.id = "statusPanel";
-document.body.append(statusPanelDiv);
-
-// Our classroom location
+// Fixed classroom location
 const CLASSROOM_LATLNG = leaflet.latLng(
   36.997936938057016,
   -122.05703507501151,
 );
 
-// Tunable gameplay parameters
-const GAMEPLAY_ZOOM_LEVEL = 19;
-const TILE_DEGREES = 1e-4;
-const NEIGHBORHOOD_SIZE = 8;
-const CACHE_SPAWN_PROBABILITY = 0.1;
+// Grid cell size
+const TILE_DEGREES = 0.0001;
 
-// Create the map (element with id "map" is defined in index.html)
+// Manual overrides for cell contents after interactions
+const cellOverrides = new Map<string, number>();
+function overrideCellValue(i: number, j: number, newValue: number) {
+  cellOverrides.set(`${i},${j}`, newValue);
+}
+function getOverriddenValue(i: number, j: number): number | null {
+  if (cellOverrides.has(`${i},${j}`)) {
+    return cellOverrides.get(`${i},${j}`)!;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------
+// PAGE SETUP
+// ---------------------------------------------------------
+
+// Map container
+const mapDiv = document.createElement("div");
+mapDiv.id = "map";
+document.body.append(mapDiv);
+
+// Inventory display
+const inventoryDiv = document.createElement("div");
+inventoryDiv.id = "inventory";
+inventoryDiv.innerText = "Inventory: (empty)";
+document.body.append(inventoryDiv);
+
+// ---------------------------------------------------------
+// MAP INITIALIZATION
+// ---------------------------------------------------------
+
 const map = leaflet.map(mapDiv, {
   center: CLASSROOM_LATLNG,
-  zoom: GAMEPLAY_ZOOM_LEVEL,
-  minZoom: GAMEPLAY_ZOOM_LEVEL,
-  maxZoom: GAMEPLAY_ZOOM_LEVEL,
+  zoom: 19,
   zoomControl: false,
   scrollWheelZoom: false,
 });
 
-// Populate the map with a background tile layer
-leaflet
-  .tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution:
-      '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-  })
-  .addTo(map);
+leaflet.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
 
-// Add a marker to represent the player
-const playerMarker = leaflet.marker(CLASSROOM_LATLNG);
-playerMarker.bindTooltip("That's you!");
-playerMarker.addTo(map);
+leaflet.marker(CLASSROOM_LATLNG)
+  .addTo(map)
+  .bindTooltip("You are here!");
 
-// Display the player's points
-let playerPoints = 0;
-statusPanelDiv.innerHTML = "No points yet...";
+// ---------------------------------------------------------
+// GRID MATH UTILITIES
+// ---------------------------------------------------------
 
-// Add caches to the map by cell numbers
-function spawnCache(i: number, j: number) {
-  // Convert cell numbers into lat/lng bounds
+function latLngToCell(lat: number, lng: number) {
   const origin = CLASSROOM_LATLNG;
-  const bounds = leaflet.latLngBounds([
-    [origin.lat + i * TILE_DEGREES, origin.lng + j * TILE_DEGREES],
-    [origin.lat + (i + 1) * TILE_DEGREES, origin.lng + (j + 1) * TILE_DEGREES],
-  ]);
-
-  // Add a rectangle to the map to represent the cache
-  const rect = leaflet.rectangle(bounds);
-  rect.addTo(map);
-
-  // Handle interactions with the cache
-  rect.bindPopup(() => {
-    // Each cache has a random point value, mutable by the player
-    let pointValue = Math.floor(luck([i, j, "initialValue"].toString()) * 100);
-
-    // The popup offers a description and button
-    const popupDiv = document.createElement("div");
-    popupDiv.innerHTML = `
-                <div>There is a cache here at "${i},${j}". It has value <span id="value">${pointValue}</span>.</div>
-                <button id="poke">poke</button>`;
-
-    // Clicking the button decrements the cache's value and increments the player's points
-    popupDiv
-      .querySelector<HTMLButtonElement>("#poke")!
-      .addEventListener("click", () => {
-        pointValue--;
-        popupDiv.querySelector<HTMLSpanElement>("#value")!.innerHTML =
-          pointValue.toString();
-        playerPoints++;
-        statusPanelDiv.innerHTML = `${playerPoints} points accumulated`;
-      });
-
-    return popupDiv;
-  });
+  const i = Math.floor((lat - origin.lat) / TILE_DEGREES);
+  const j = Math.floor((lng - origin.lng) / TILE_DEGREES);
+  return { i, j };
 }
 
-// Look around the player's neighborhood for caches to spawn
-for (let i = -NEIGHBORHOOD_SIZE; i < NEIGHBORHOOD_SIZE; i++) {
-  for (let j = -NEIGHBORHOOD_SIZE; j < NEIGHBORHOOD_SIZE; j++) {
-    // If location i,j is lucky enough, spawn a cache!
-    if (luck([i, j].toString()) < CACHE_SPAWN_PROBABILITY) {
-      spawnCache(i, j);
+function cellToBounds(i: number, j: number): leaflet.LatLngBounds {
+  const origin = CLASSROOM_LATLNG;
+
+  const lat1 = origin.lat + i * TILE_DEGREES;
+  const lng1 = origin.lng + j * TILE_DEGREES;
+  const lat2 = origin.lat + (i + 1) * TILE_DEGREES;
+  const lng2 = origin.lng + (j + 1) * TILE_DEGREES;
+
+  return leaflet.latLngBounds([
+    [lat1, lng1],
+    [lat2, lng2],
+  ]);
+}
+
+// ---------------------------------------------------------
+// TOKEN GENERATION (DETERMINISTIC)
+// ---------------------------------------------------------
+
+function getTokenValue(i: number, j: number): number {
+  const override = getOverriddenValue(i, j);
+  if (override !== null) return override;
+
+  const r = luck(`${i},${j}`);
+  if (r < 0.15) return 1;
+  return 0;
+}
+
+// ---------------------------------------------------------
+// INTERACTION & GAMEPLAY LOGIC
+// ---------------------------------------------------------
+
+let inventoryValue = 0;
+
+function updateInventoryUI() {
+  if (inventoryValue === 0) {
+    inventoryDiv.innerText = "Inventory: (empty)";
+  } else {
+    inventoryDiv.innerText = `Inventory: ${inventoryValue}`;
+  }
+}
+
+// Can only interact with cells within 3 cells of the classroom marker
+function isCellNearby(i: number, j: number): boolean {
+  const playerCell = latLngToCell(CLASSROOM_LATLNG.lat, CLASSROOM_LATLNG.lng);
+
+  const di = Math.abs(i - playerCell.i);
+  const dj = Math.abs(j - playerCell.j);
+
+  return di <= 3 && dj <= 3;
+}
+
+function checkWinCondition() {
+  if (inventoryValue >= 16) {
+    alert("You crafted a high-value token! You win!");
+  }
+}
+
+function handleCellClick(i: number, j: number) {
+  if (!isCellNearby(i, j)) {
+    console.log("Too far away — cannot interact.");
+    return;
+  }
+
+  const cellValue = getTokenValue(i, j);
+
+  // PICKUP CASE
+  if (inventoryValue === 0) {
+    if (cellValue > 0) {
+      inventoryValue = cellValue;
+      overrideCellValue(i, j, 0);
+      updateInventoryUI();
+      drawVisibleCells();
     }
+    return;
+  }
+
+  // MERGE CASE
+  if (inventoryValue > 0) {
+    if (cellValue === inventoryValue && cellValue > 0) {
+      const newValue = inventoryValue * 2;
+      overrideCellValue(i, j, newValue);
+      inventoryValue = 0;
+      updateInventoryUI();
+      drawVisibleCells();
+      checkWinCondition();
+      return;
+    }
+  }
+
+  console.log("Cannot merge: values do not match.");
+}
+
+// ---------------------------------------------------------
+// GRID RENDERING
+// ---------------------------------------------------------
+
+const cellLayer = leaflet.layerGroup().addTo(map);
+
+map.on("moveend", () => drawVisibleCells());
+drawVisibleCells();
+
+function drawVisibleCells() {
+  cellLayer.clearLayers();
+
+  const bounds = map.getBounds();
+  const nw = bounds.getNorthWest();
+  const se = bounds.getSouthEast();
+
+  const c1 = latLngToCell(nw.lat, nw.lng);
+  const c2 = latLngToCell(se.lat, se.lng);
+
+  const minI = Math.min(c1.i, c2.i);
+  const maxI = Math.max(c1.i, c2.i);
+  const minJ = Math.min(c1.j, c2.j);
+  const maxJ = Math.max(c1.j, c2.j);
+
+  for (let i = minI - 1; i <= maxI + 1; i++) {
+    for (let j = minJ - 1; j <= maxJ + 1; j++) {
+      drawCell(i, j);
+    }
+  }
+}
+
+function drawCell(i: number, j: number) {
+  const bounds = cellToBounds(i, j);
+
+  // Cell rectangle
+  const rect = leaflet.rectangle(bounds, {
+    color: "red",
+    weight: 2,
+    fillOpacity: 0.02,
+  });
+  rect.addTo(cellLayer);
+
+  rect.on("click", () => handleCellClick(i, j));
+
+  const value = getTokenValue(i, j);
+
+  if (value > 0) {
+    const center = bounds.getCenter();
+
+    leaflet
+      .marker(center, {
+        icon: leaflet.divIcon({
+          className: "token-label",
+          html: `<div class="token-text">${value}</div>`,
+        }),
+      })
+      .addTo(cellLayer);
   }
 }
