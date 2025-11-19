@@ -7,7 +7,7 @@ import luck from "./_luck.ts";
 import "./style.css";
 
 // =====================================================
-// DEBUG HELPERS — no-explicit-any removed
+// DEBUG HELPERS (lint-safe)
 // =====================================================
 function DBG(tag: string, ...args: unknown[]) {
   console.log(`[${tag}]`, ...args);
@@ -21,7 +21,7 @@ const DBG_INV = (...a: unknown[]) => DBG("INV", ...a);
 // CONSTANTS
 // =====================================================
 
-const GRID_ORIGIN = { lat: 0, lng: 0 };
+const GRID_ORIGIN = { lat: 0, lng: 0 }; // Null Island
 const VISUAL_ORIGIN = leaflet.latLng(
   36.997936938057016,
   -122.05703507501151,
@@ -63,7 +63,14 @@ leaflet.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 const playerMarker = leaflet.marker(playerLatLng).addTo(map);
 
 // =====================================================
-// COORDINATE CONVERSION
+// WORLD STATE — MEMENTO STORAGE (D3.C requirement)
+// Only stores modified cells!
+// =====================================================
+
+const worldState = new Map<string, number | null>();
+
+// =====================================================
+// COORDINATE CONVERSION HELPERS
 // =====================================================
 
 function latLngToRealCell(latlng: leaflet.LatLng) {
@@ -92,26 +99,20 @@ function key(i: number, j: number) {
 }
 
 // =====================================================
-// TOKEN SYSTEM — MEMORYLESS FOR D3.B
+// TOKEN SYSTEM — FLYWEIGHT + MEMENTO
 // =====================================================
 
-const visibleCellState = new Map<string, number | null>();
-
-function getTokenForCell(i_real: number, j_real: number): number | null {
+function getCellToken(i_real: number, j_real: number): number | null {
   const k = key(i_real, j_real);
 
-  if (visibleCellState.has(k)) return visibleCellState.get(k)!;
+  // If modified, return stored value (Memento)
+  if (worldState.has(k)) return worldState.get(k)!;
 
+  // Otherwise generate deterministic token (Flyweight base state)
   const roll = luck(k);
-
   if (roll < 0.15) {
-    const val = roll < 0.075 ? 1 : 2;
-    visibleCellState.set(k, val);
-    DBG_CELL("spawn token", val, "at", k);
-    return val;
+    return roll < 0.075 ? 1 : 2;
   }
-
-  visibleCellState.set(k, null);
   return null;
 }
 
@@ -139,16 +140,15 @@ function checkWin() {
 }
 
 // =====================================================
-// GRID DRAWING
+// GRID DRAWING — FULL REBUILD (D3.C requirement)
 // =====================================================
 
 let gridLayers: leaflet.Layer[] = [];
 
 function redrawGrid() {
-  DBG_GRID("=== START ===");
+  DBG_GRID("=== REDRAW START ===");
 
-  const oldKeys = new Set(visibleCellState.keys());
-
+  // Remove old draw
   gridLayers.forEach((l) => map.removeLayer(l));
   gridLayers = [];
 
@@ -164,26 +164,22 @@ function redrawGrid() {
   let drawCount = 0;
   let tokenCount = 0;
 
-  const newVisible = new Set<string>();
-
   for (let i_vis = tl.i - 1; i_vis <= br.i + 1; i_vis++) {
     for (let j_vis = tl.j - 1; j_vis <= br.j + 1; j_vis++) {
-      const b = visualCellToBounds(i_vis, j_vis);
-      const rect = leaflet.rectangle(b, { color: "red", weight: 1 });
+      const bounds2 = visualCellToBounds(i_vis, j_vis);
+      const rect = leaflet.rectangle(bounds2, { color: "red", weight: 1 });
       rect.addTo(map);
       gridLayers.push(rect);
 
       drawCount++;
 
-      const center = b.getCenter();
+      const center = bounds2.getCenter();
       const { i: i_real, j: j_real } = latLngToRealCell(center);
-      const k = key(i_real, j_real);
+      const _k = key(i_real, j_real);
 
-      newVisible.add(k);
+      const tokenVal = getCellToken(i_real, j_real);
 
-      const tokenVal = getTokenForCell(i_real, j_real);
-
-      const click = () => handleCellClick(i_real, j_real, tokenVal);
+      const click = () => handleCellClick(i_real, j_real);
       rect.on("click", click);
 
       if (tokenVal !== null) {
@@ -201,66 +197,57 @@ function redrawGrid() {
     }
   }
 
-  oldKeys.forEach((k) => {
-    if (!newVisible.has(k)) visibleCellState.delete(k);
-  });
-
-  DBG_GRID("Draw count:", drawCount);
-  DBG_GRID("Tokens spawned:", tokenCount);
-  DBG_GRID("=== END ===");
+  DBG_GRID("Drawn cells:", drawCount);
+  DBG_GRID("Tokens shown:", tokenCount);
+  DBG_GRID("=== REDRAW END ===");
 }
 
 map.on("moveend", redrawGrid);
 redrawGrid();
 
 // =====================================================
-// CLICK HANDLING — PICKUP, PLACE, MERGE
+// CLICK HANDLING — PERSISTENT PICKUP, PLACE, MERGE
 // =====================================================
 
-function handleCellClick(
-  i_real: number,
-  j_real: number,
-  tokenValue: number | null,
-) {
+function handleCellClick(i_real: number, j_real: number) {
   const k = key(i_real, j_real);
-  DBG_CELL("clicked", k, "token:", tokenValue);
 
   if (!isCellNearby(i_real, j_real)) {
     DBG_CELL("too far");
     return;
   }
 
-  // PLACE TOKEN
+  const tokenValue = getCellToken(i_real, j_real);
+  DBG_CELL("clicked", k, "token:", tokenValue);
+
+  // PLACE
   if (tokenValue === null && heldToken !== null) {
-    DBG_INV("placing", heldToken, "at", k);
-    visibleCellState.set(k, heldToken);
+    DBG_INV("place", heldToken, "at", k);
+    worldState.set(k, heldToken);
     heldToken = null;
     updateInventoryUI();
     redrawGrid();
-    checkWin();
     return;
   }
 
-  // PICKUP TOKEN
+  // PICKUP
   if (tokenValue !== null && heldToken === null) {
     DBG_INV("pickup", tokenValue, "from", k);
     heldToken = tokenValue;
-    visibleCellState.set(k, null);
+    worldState.set(k, null);
     updateInventoryUI();
     redrawGrid();
-    checkWin();
     return;
   }
 
-  // MERGE TOKEN
+  // MERGE
   if (tokenValue !== null && heldToken === tokenValue) {
     const newVal = heldToken * 2;
     DBG_INV(`merge ${heldToken} + ${tokenValue} = ${newVal}`);
     heldToken = newVal;
-    visibleCellState.set(k, null);
+    worldState.set(k, null);
     updateInventoryUI();
     redrawGrid();
-    checkWin();
     return;
   }
 
