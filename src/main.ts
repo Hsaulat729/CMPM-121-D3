@@ -1,235 +1,305 @@
 // @deno-types="npm:@types/leaflet"
 import leaflet from "leaflet";
 
-// Styles
 import "leaflet/dist/leaflet.css";
+import "./_leafletWorkaround.ts";
+import luck from "./_luck.ts";
 import "./style.css";
 
-// Fix missing marker images
-import "./_leafletWorkaround.ts";
+// =====================================================
+// DEBUG HELPERS — no-explicit-any removed
+// =====================================================
+function DBG(tag: string, ...args: unknown[]) {
+  console.log(`[${tag}]`, ...args);
+}
+const DBG_CELL = (...a: unknown[]) => DBG("CELL", ...a);
+const DBG_GRID = (...a: unknown[]) => DBG("GRID", ...a);
+const DBG_MOVE = (...a: unknown[]) => DBG("MOVE", ...a);
+const DBG_INV = (...a: unknown[]) => DBG("INV", ...a);
 
-// Deterministic hashing function
-import luck from "./_luck.ts";
-
-// ---------------------------------------------------------
+// =====================================================
 // CONSTANTS
-// ---------------------------------------------------------
+// =====================================================
 
-// Fixed classroom location
-const CLASSROOM_LATLNG = leaflet.latLng(
+const GRID_ORIGIN = { lat: 0, lng: 0 };
+const VISUAL_ORIGIN = leaflet.latLng(
   36.997936938057016,
   -122.05703507501151,
 );
 
-// Grid cell size
 const TILE_DEGREES = 0.0001;
+const INTERACT_RANGE = 3;
 
-// Manual overrides for cell contents after interactions
-const cellOverrides = new Map<string, number>();
-function overrideCellValue(i: number, j: number, newValue: number) {
-  cellOverrides.set(`${i},${j}`, newValue);
-}
-function getOverriddenValue(i: number, j: number): number | null {
-  if (cellOverrides.has(`${i},${j}`)) {
-    return cellOverrides.get(`${i},${j}`)!;
-  }
-  return null;
-}
+let playerLatLng = VISUAL_ORIGIN.clone();
 
-// ---------------------------------------------------------
-// PAGE SETUP
-// ---------------------------------------------------------
+// =====================================================
+// DOM SETUP
+// =====================================================
 
-// Map container
-const mapDiv = document.createElement("div");
-mapDiv.id = "map";
-document.body.append(mapDiv);
-
-// Inventory display
 const inventoryDiv = document.createElement("div");
 inventoryDiv.id = "inventory";
-inventoryDiv.innerText = "Inventory: (empty)";
-document.body.append(inventoryDiv);
+document.body.appendChild(inventoryDiv);
 
-// ---------------------------------------------------------
-// MAP INITIALIZATION
-// ---------------------------------------------------------
+const mapDiv = document.createElement("div");
+mapDiv.id = "map";
+document.body.appendChild(mapDiv);
+
+let heldToken: number | null = null;
+updateInventoryUI();
+
+// =====================================================
+// MAP SETUP
+// =====================================================
 
 const map = leaflet.map(mapDiv, {
-  center: CLASSROOM_LATLNG,
+  center: VISUAL_ORIGIN,
   zoom: 19,
-  zoomControl: false,
-  scrollWheelZoom: false,
 });
 
 leaflet.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
-  attribution: "&copy; OpenStreetMap contributors",
 }).addTo(map);
 
-leaflet.marker(CLASSROOM_LATLNG)
-  .addTo(map)
-  .bindTooltip("You are here!");
+const playerMarker = leaflet.marker(playerLatLng).addTo(map);
 
-// ---------------------------------------------------------
-// GRID MATH UTILITIES
-// ---------------------------------------------------------
+// =====================================================
+// COORDINATE CONVERSION
+// =====================================================
 
-function latLngToCell(lat: number, lng: number) {
-  const origin = CLASSROOM_LATLNG;
-  const i = Math.floor((lat - origin.lat) / TILE_DEGREES);
-  const j = Math.floor((lng - origin.lng) / TILE_DEGREES);
+function latLngToRealCell(latlng: leaflet.LatLng) {
+  return {
+    i: Math.floor((latlng.lat - GRID_ORIGIN.lat) / TILE_DEGREES),
+    j: Math.floor((latlng.lng - GRID_ORIGIN.lng) / TILE_DEGREES),
+  };
+}
+
+function latLngToVisualCell(latlng: leaflet.LatLng) {
+  const i = Math.floor((VISUAL_ORIGIN.lat - latlng.lat) / TILE_DEGREES);
+  const j = Math.floor((latlng.lng - VISUAL_ORIGIN.lng) / TILE_DEGREES);
   return { i, j };
 }
 
-function cellToBounds(i: number, j: number): leaflet.LatLngBounds {
-  const origin = CLASSROOM_LATLNG;
-
-  const lat1 = origin.lat + i * TILE_DEGREES;
-  const lng1 = origin.lng + j * TILE_DEGREES;
-  const lat2 = origin.lat + (i + 1) * TILE_DEGREES;
-  const lng2 = origin.lng + (j + 1) * TILE_DEGREES;
-
-  return leaflet.latLngBounds([
-    [lat1, lng1],
-    [lat2, lng2],
-  ]);
+function visualCellToBounds(i: number, j: number) {
+  const lat1 = VISUAL_ORIGIN.lat - i * TILE_DEGREES;
+  const lng1 = VISUAL_ORIGIN.lng + j * TILE_DEGREES;
+  const lat2 = lat1 - TILE_DEGREES;
+  const lng2 = lng1 + TILE_DEGREES;
+  return leaflet.latLngBounds([[lat1, lng1], [lat2, lng2]]);
 }
 
-// ---------------------------------------------------------
-// TOKEN GENERATION (DETERMINISTIC)
-// ---------------------------------------------------------
-
-function getTokenValue(i: number, j: number): number {
-  const override = getOverriddenValue(i, j);
-  if (override !== null) return override;
-
-  const r = luck(`${i},${j}`);
-  if (r < 0.15) return 1;
-  return 0;
+function key(i: number, j: number) {
+  return `${i},${j}`;
 }
 
-// ---------------------------------------------------------
-// INTERACTION & GAMEPLAY LOGIC
-// ---------------------------------------------------------
+// =====================================================
+// TOKEN SYSTEM — MEMORYLESS FOR D3.B
+// =====================================================
 
-let inventoryValue = 0;
+const visibleCellState = new Map<string, number | null>();
 
-function updateInventoryUI() {
-  if (inventoryValue === 0) {
-    inventoryDiv.innerText = "Inventory: (empty)";
-  } else {
-    inventoryDiv.innerText = `Inventory: ${inventoryValue}`;
+function getTokenForCell(i_real: number, j_real: number): number | null {
+  const k = key(i_real, j_real);
+
+  if (visibleCellState.has(k)) return visibleCellState.get(k)!;
+
+  const roll = luck(k);
+
+  if (roll < 0.15) {
+    const val = roll < 0.075 ? 1 : 2;
+    visibleCellState.set(k, val);
+    DBG_CELL("spawn token", val, "at", k);
+    return val;
+  }
+
+  visibleCellState.set(k, null);
+  return null;
+}
+
+// =====================================================
+// INTERACTION RANGE
+// =====================================================
+
+function isCellNearby(i_real: number, j_real: number) {
+  const p = latLngToRealCell(playerLatLng);
+  return (
+    Math.abs(p.i - i_real) <= INTERACT_RANGE &&
+    Math.abs(p.j - j_real) <= INTERACT_RANGE
+  );
+}
+
+// =====================================================
+// WIN CONDITION
+// =====================================================
+
+function checkWin() {
+  if (heldToken !== null && heldToken >= 50) {
+    DBG_INV("WIN CONDITION MET — held:", heldToken);
+    alert(`🎉 You win! You created a token of value ${heldToken}.`);
   }
 }
 
-// Can only interact with cells within 3 cells of the classroom marker
-function isCellNearby(i: number, j: number): boolean {
-  const playerCell = latLngToCell(CLASSROOM_LATLNG.lat, CLASSROOM_LATLNG.lng);
+// =====================================================
+// GRID DRAWING
+// =====================================================
 
-  const di = Math.abs(i - playerCell.i);
-  const dj = Math.abs(j - playerCell.j);
+let gridLayers: leaflet.Layer[] = [];
 
-  return di <= 3 && dj <= 3;
-}
+function redrawGrid() {
+  DBG_GRID("=== START ===");
 
-function checkWinCondition() {
-  if (inventoryValue >= 16) {
-    alert("You crafted a high-value token! You win!");
-  }
-}
+  const oldKeys = new Set(visibleCellState.keys());
 
-function handleCellClick(i: number, j: number) {
-  if (!isCellNearby(i, j)) {
-    console.log("Too far away — cannot interact.");
-    return;
-  }
-
-  const cellValue = getTokenValue(i, j);
-
-  // PICKUP CASE
-  if (inventoryValue === 0) {
-    if (cellValue > 0) {
-      inventoryValue = cellValue;
-      overrideCellValue(i, j, 0);
-      updateInventoryUI();
-      drawVisibleCells();
-    }
-    return;
-  }
-
-  // MERGE CASE
-  if (inventoryValue > 0) {
-    if (cellValue === inventoryValue && cellValue > 0) {
-      const newValue = inventoryValue * 2;
-      overrideCellValue(i, j, newValue);
-      inventoryValue = 0;
-      updateInventoryUI();
-      drawVisibleCells();
-      checkWinCondition();
-      return;
-    }
-  }
-
-  console.log("Cannot merge: values do not match.");
-}
-
-// ---------------------------------------------------------
-// GRID RENDERING
-// ---------------------------------------------------------
-
-const cellLayer = leaflet.layerGroup().addTo(map);
-
-map.on("moveend", () => drawVisibleCells());
-drawVisibleCells();
-
-function drawVisibleCells() {
-  cellLayer.clearLayers();
+  gridLayers.forEach((l) => map.removeLayer(l));
+  gridLayers = [];
 
   const bounds = map.getBounds();
   const nw = bounds.getNorthWest();
   const se = bounds.getSouthEast();
 
-  const c1 = latLngToCell(nw.lat, nw.lng);
-  const c2 = latLngToCell(se.lat, se.lng);
+  const tl = latLngToVisualCell(nw);
+  const br = latLngToVisualCell(se);
 
-  const minI = Math.min(c1.i, c2.i);
-  const maxI = Math.max(c1.i, c2.i);
-  const minJ = Math.min(c1.j, c2.j);
-  const maxJ = Math.max(c1.j, c2.j);
+  DBG_GRID("Visible VISUAL range", tl, br);
 
-  for (let i = minI - 1; i <= maxI + 1; i++) {
-    for (let j = minJ - 1; j <= maxJ + 1; j++) {
-      drawCell(i, j);
+  let drawCount = 0;
+  let tokenCount = 0;
+
+  const newVisible = new Set<string>();
+
+  for (let i_vis = tl.i - 1; i_vis <= br.i + 1; i_vis++) {
+    for (let j_vis = tl.j - 1; j_vis <= br.j + 1; j_vis++) {
+      const b = visualCellToBounds(i_vis, j_vis);
+      const rect = leaflet.rectangle(b, { color: "red", weight: 1 });
+      rect.addTo(map);
+      gridLayers.push(rect);
+
+      drawCount++;
+
+      const center = b.getCenter();
+      const { i: i_real, j: j_real } = latLngToRealCell(center);
+      const k = key(i_real, j_real);
+
+      newVisible.add(k);
+
+      const tokenVal = getTokenForCell(i_real, j_real);
+
+      const click = () => handleCellClick(i_real, j_real, tokenVal);
+      rect.on("click", click);
+
+      if (tokenVal !== null) {
+        tokenCount++;
+        const label = leaflet.marker(center, {
+          icon: leaflet.divIcon({
+            className: "cell-label",
+            html: `<b>${tokenVal}</b>`,
+          }),
+        });
+        label.addTo(map);
+        gridLayers.push(label);
+        label.on("click", click);
+      }
     }
   }
-}
 
-function drawCell(i: number, j: number) {
-  const bounds = cellToBounds(i, j);
-
-  // Cell rectangle
-  const rect = leaflet.rectangle(bounds, {
-    color: "red",
-    weight: 2,
-    fillOpacity: 0.02,
+  oldKeys.forEach((k) => {
+    if (!newVisible.has(k)) visibleCellState.delete(k);
   });
-  rect.addTo(cellLayer);
 
-  rect.on("click", () => handleCellClick(i, j));
-
-  const value = getTokenValue(i, j);
-
-  if (value > 0) {
-    const center = bounds.getCenter();
-
-    leaflet
-      .marker(center, {
-        icon: leaflet.divIcon({
-          className: "token-label",
-          html: `<div class="token-text">${value}</div>`,
-        }),
-      })
-      .addTo(cellLayer);
-  }
+  DBG_GRID("Draw count:", drawCount);
+  DBG_GRID("Tokens spawned:", tokenCount);
+  DBG_GRID("=== END ===");
 }
+
+map.on("moveend", redrawGrid);
+redrawGrid();
+
+// =====================================================
+// CLICK HANDLING — PICKUP, PLACE, MERGE
+// =====================================================
+
+function handleCellClick(
+  i_real: number,
+  j_real: number,
+  tokenValue: number | null,
+) {
+  const k = key(i_real, j_real);
+  DBG_CELL("clicked", k, "token:", tokenValue);
+
+  if (!isCellNearby(i_real, j_real)) {
+    DBG_CELL("too far");
+    return;
+  }
+
+  // PLACE TOKEN
+  if (tokenValue === null && heldToken !== null) {
+    DBG_INV("placing", heldToken, "at", k);
+    visibleCellState.set(k, heldToken);
+    heldToken = null;
+    updateInventoryUI();
+    redrawGrid();
+    checkWin();
+    return;
+  }
+
+  // PICKUP TOKEN
+  if (tokenValue !== null && heldToken === null) {
+    DBG_INV("pickup", tokenValue, "from", k);
+    heldToken = tokenValue;
+    visibleCellState.set(k, null);
+    updateInventoryUI();
+    redrawGrid();
+    checkWin();
+    return;
+  }
+
+  // MERGE TOKEN
+  if (tokenValue !== null && heldToken === tokenValue) {
+    const newVal = heldToken * 2;
+    DBG_INV(`merge ${heldToken} + ${tokenValue} = ${newVal}`);
+    heldToken = newVal;
+    visibleCellState.set(k, null);
+    updateInventoryUI();
+    redrawGrid();
+    checkWin();
+    return;
+  }
+
+  DBG_CELL("no valid interaction");
+}
+
+// =====================================================
+// INVENTORY UI
+// =====================================================
+
+function updateInventoryUI() {
+  inventoryDiv.innerHTML = heldToken === null
+    ? "Inventory: (empty)"
+    : `Inventory: ${heldToken}`;
+  DBG_INV("Inventory:", heldToken);
+  checkWin();
+}
+
+// =====================================================
+// MOVEMENT (WASD)
+// =====================================================
+
+document.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (!["w", "a", "s", "d"].includes(k)) return;
+
+  let { lat, lng } = playerLatLng;
+
+  if (k === "w") lat += TILE_DEGREES;
+  if (k === "s") lat -= TILE_DEGREES;
+  if (k === "a") lng -= TILE_DEGREES;
+  if (k === "d") lng += TILE_DEGREES;
+
+  playerLatLng = leaflet.latLng(lat, lng);
+  playerMarker.setLatLng(playerLatLng);
+  map.setView(playerLatLng);
+
+  DBG_MOVE("Moved", k, "to", playerLatLng);
+
+  checkWin();
+  redrawGrid();
+});
